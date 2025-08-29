@@ -1,1 +1,10 @@
 __pycache__
+
+# Ignore model checkpoints
+*.pth
+
+# Ignore audio files
+*.wav
+
+# Ignore text files
+*.txt

@@ -23,7 +23,7 @@ import pandas as pd
 _pad = "$"
 _punctuation = ';:,.!?¡¿—…"«»“” '
 _letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-_letters_ipa = "ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘'̩'ᵻ"
+_letters_ipa = "ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢǀǁ̃ǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘'̩'ᵻ"
 
 # Export all symbols:
 symbols = [_pad] + list(_punctuation) + list(_letters) + list(_letters_ipa)
@@ -47,16 +47,16 @@ class TextCleaner:
 np.random.seed(1)
 random.seed(1)
 SPECT_PARAMS = {
-    "n_fft": 2048,
-    "win_length": 1200,
-    "hop_length": 300
+    "n_fft": 4096,
+    "win_length": 2400,
+    "hop_length": 600
 }
 MEL_PARAMS = {
-    "n_mels": 80,
+    "n_mels": 128,
 }
 
 to_mel = torchaudio.transforms.MelSpectrogram(
-    n_mels=80, n_fft=2048, win_length=1200, hop_length=300)
+    n_mels=128, n_fft=4096, win_length=2400, hop_length=600)
 mean, std = -4, 4
 
 def preprocess(wave):
@@ -69,7 +69,7 @@ class FilePathDataset(torch.utils.data.Dataset):
     def __init__(self,
                  data_list,
                  root_path,
-                 sr=24000,
+                 sr=44100,
                  data_augmentation=False,
                  validation=False,
                  OOD_data="Data/OOD_texts.txt",
@@ -141,12 +141,12 @@ class FilePathDataset(torch.utils.data.Dataset):
         wave, sr = sf.read(osp.join(self.root_path, wave_path))
         if wave.shape[-1] == 2:
             wave = wave[:, 0].squeeze()
-        if sr != 24000:
-            wave = librosa.resample(wave, orig_sr=sr, target_sr=24000)
+        if sr != 44100:
+            wave = librosa.resample(wave, orig_sr=sr, target_sr=44100)
             print(wave_path, sr)
             
-        wave = np.concatenate([np.zeros([5000]), wave, np.zeros([5000])], axis=0)
-        
+        wave = np.concatenate([np.zeros([10000]), wave, np.zeros([10000])], axis=0)
+        #wave = np.concatenate([np.zeros([2500]), wave, np.zeros([2500])], axis=0)
         text = self.text_cleaner(text)
         
         text.insert(0, 0)
@@ -226,7 +226,7 @@ class Collater(object):
             ref_labels[bid] = ref_label
             waves[bid] = wave
 
-        return waves, texts, input_lengths, ref_texts, ref_lengths, mels, output_lengths, ref_mels
+        return waves, texts, input_lengths, ref_texts, ref_lengths, mels, output_lengths, ref_mels 
 
 
 

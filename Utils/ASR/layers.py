@@ -330,7 +330,7 @@ class PhaseShuffle1d(nn.Module):
         return shuffled
 
 class MFCC(nn.Module):
-    def __init__(self, n_mfcc=40, n_mels=80):
+    def __init__(self, n_mfcc=64, n_mels=128):
         super(MFCC, self).__init__()
         self.n_mfcc = n_mfcc
         self.n_mels = n_mels

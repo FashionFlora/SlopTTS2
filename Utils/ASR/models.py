@@ -7,9 +7,9 @@ from .layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock
 
 class ASRCNN(nn.Module):
     def __init__(self,
-                 input_dim=80,
+                 input_dim=128,
                  hidden_dim=256,
-                 n_token=35,
+                 n_token=178,
                  n_layers=6,
                  token_embedding_dim=256,
 
@@ -77,7 +77,7 @@ class ASRS2S(nn.Module):
                  hidden_dim=512,
                  n_location_filters=32,
                  location_kernel_size=63,
-                 n_token=40):
+                 n_token=178):
         super(ASRS2S, self).__init__()
         self.embedding = nn.Embedding(n_token, embedding_dim)
         val_range = math.sqrt(6 / hidden_dim)
@@ -123,9 +123,10 @@ class ASRS2S(nn.Module):
         """
         self.initialize_decoder_states(memory, memory_mask)
         # text random mask
+        
         random_mask = (torch.rand(text_input.shape) < self.random_mask).to(text_input.device)
         _text_input = text_input.clone()
-        _text_input.masked_fill_(random_mask, self.unk_index)
+        #_text_input.masked_fill_(random_mask, self.unk_index)
         decoder_inputs = self.embedding(_text_input).transpose(0, 1) # -> [T, B, channel]
         start_embedding = self.embedding(
             torch.LongTensor([self.sos]*decoder_inputs.size(1)).to(decoder_inputs.device))

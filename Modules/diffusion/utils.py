@@ -80,3 +80,22 @@ def groupby(prefix: str, d: Dict, keep_prefix: bool = False) -> Tuple[Dict, Dict
 
 def prefix_dict(prefix: str, d: Dict) -> Dict:
     return {prefix + str(k): v for k, v in d.items()}
+    
+    
+    
+    
+    
+
+
+STYLE_DIM = 256
+HALF = 128
+
+def pack_style(acoustic: torch.Tensor, prosody: torch.Tensor) -> torch.Tensor:
+    # [B, 128] + [B, 128] -> [B, 256] as [acoustic | prosody]
+    assert acoustic.shape == prosody.shape and acoustic.shape[-1] == HALF
+    return torch.cat([acoustic, prosody], dim=-1)
+
+def unpack_style(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    # [B, 256] -> (acoustic, prosody)
+    assert x.shape[-1] == STYLE_DIM
+    return x[:, :HALF], x[:, HALF:]    

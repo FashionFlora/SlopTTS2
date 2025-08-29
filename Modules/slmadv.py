@@ -25,7 +25,8 @@ class SLMAdversarialLoss(torch.nn.Module):
         if use_ind and np.random.rand() < 0.5:
             s_preds = s_trg
         else:
-            num_steps = np.random.randint(3, 5)
+            with torch.no_grad():
+                    num_steps = torch.randint(24, 33, (1,)).item() 
             if ref_s is not None:
                 s_preds = self.sampler(noise = torch.randn_like(s_trg).unsqueeze(1).to(ref_text.device), 
                       embedding=bert_dur,
@@ -120,7 +121,7 @@ class SLMAdversarialLoss(torch.nn.Module):
 
             # get ground truth clips
             random_start = np.random.randint(0, mel_length_gt - mel_len)
-            y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
+            y = waves[bib][(random_start * 2) * 600:((random_start+mel_len) * 2) * 600]
             wav.append(torch.from_numpy(y).to(ref_text.device))
             
             if len(wav) >= self.batch_percentage * len(waves): # prevent OOM due to longer lengths

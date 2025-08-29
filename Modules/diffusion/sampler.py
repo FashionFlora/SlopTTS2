@@ -4,9 +4,9 @@ from typing import Any, Callable, List, Optional, Tuple, Type
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, reduce
 from torch import Tensor
-
+from einops import rearrange
+from einops import reduce as einops_reduce
 from .utils import *
 
 """
@@ -38,25 +38,7 @@ class UniformDistribution(Distribution):
         return torch.rand(num_samples, device=device)
 
 
-class VKDistribution(Distribution):
-    def __init__(
-        self,
-        min_value: float = 0.0,
-        max_value: float = float("inf"),
-        sigma_data: float = 1.0,
-    ):
-        self.min_value = min_value
-        self.max_value = max_value
-        self.sigma_data = sigma_data
 
-    def __call__(
-        self, num_samples: int, device: torch.device = torch.device("cpu")
-    ) -> Tensor:
-        sigma_data = self.sigma_data
-        min_cdf = atan(self.min_value / sigma_data) * 2 / pi
-        max_cdf = atan(self.max_value / sigma_data) * 2 / pi
-        u = (max_cdf - min_cdf) * torch.randn((num_samples,), device=device) + min_cdf
-        return torch.tan(u * pi / 2) * sigma_data
 
 
 """ Diffusion Classes """
@@ -228,73 +210,106 @@ class KDiffusion(Diffusion):
 
         # Compute weighted loss
         losses = F.mse_loss(x_denoised, x, reduction="none")
-        losses = reduce(losses, "b ... -> b", "mean")
+        losses = einops_reduce(losses, "b ... -> b", "mean")
         losses = losses * self.loss_weight(sigmas)
         loss = losses.mean()
         return loss
 
 
-class VKDiffusion(Diffusion):
-
+class VKDiffusion(nn.Module):
     alias = "vk"
 
-    def __init__(self, net: nn.Module, *, sigma_distribution: Distribution):
+    def __init__(
+        self,
+        net: nn.Module,
+        *,
+        sigma_distribution: Distribution,
+        min_snr_gamma: Optional[float] = 5.0,
+        robust: Optional[str] = "huber",   # None | "huber" | "charbonnier"
+        huber_delta: float = 0.5,
+        charbonnier_eps: float = 1e-3,
+        sigma_min_clamp: float = 1e-3,
+        sigma_max_clamp: float = 1.0,
+        normalize_weight: bool = True,
+        lambda_x0: float = 0.1,            # NOWE: waga kotwicy x0
+    ):
         super().__init__()
         self.net = net
         self.sigma_distribution = sigma_distribution
+        self.min_snr_gamma = min_snr_gamma
+        self.robust = robust
+        self.huber_delta = huber_delta
+        self.charbonnier_eps = charbonnier_eps
+        self.sigma_min_clamp = sigma_min_clamp
+        self.sigma_max_clamp = sigma_max_clamp
+        self.normalize_weight = normalize_weight
+        self.lambda_x0 = lambda_x0
 
-    def get_scale_weights(self, sigmas: Tensor) -> Tuple[Tensor, ...]:
-        sigma_data = 1.0
-        sigmas = rearrange(sigmas, "b -> b 1 1")
-        c_skip = (sigma_data ** 2) / (sigmas ** 2 + sigma_data ** 2)
-        c_out = -sigmas * sigma_data * (sigma_data ** 2 + sigmas ** 2) ** -0.5
-        c_in = (sigmas ** 2 + sigma_data ** 2) ** -0.5
-        return c_skip, c_out, c_in
+    def get_scale_weights(self, sigmas: Tensor):
+        sigmas = sigmas.clamp(self.sigma_min_clamp, self.sigma_max_clamp)
+        sigmas_ = rearrange(sigmas, "b -> b 1 1")
+        denom = (sigmas_**2 + 1.0)
+        c_skip = 1.0 / denom
+        c_out  = -sigmas_ * (denom**-0.5)
+        c_in   = denom**-0.5
+        return c_skip, c_out, c_in, sigmas
 
     def sigma_to_t(self, sigmas: Tensor) -> Tensor:
-        return sigmas.atan() / pi * 2
+        sigmas = sigmas.clamp(self.sigma_min_clamp, self.sigma_max_clamp)
+        return sigmas.atan() / pi * 2.0
 
-    def t_to_sigma(self, t: Tensor) -> Tensor:
-        return (t * pi / 2).tan()
-
-    def denoise_fn(
-        self,
-        x_noisy: Tensor,
-        sigmas: Optional[Tensor] = None,
-        sigma: Optional[float] = None,
-        **kwargs,
-    ) -> Tensor:
-        batch_size, device = x_noisy.shape[0], x_noisy.device
-        sigmas = to_batch(x=sigma, xs=sigmas, batch_size=batch_size, device=device)
-
-        # Predict network output and add skip connection
-        c_skip, c_out, c_in = self.get_scale_weights(sigmas)
-        x_pred = self.net(c_in * x_noisy, self.sigma_to_t(sigmas), **kwargs)
+    @torch.no_grad()
+    def denoise_fn(self, x_noisy: Tensor, sigmas: Optional[Tensor] = None, sigma: Optional[float] = None, **kwargs) -> Tensor:
+        b, device = x_noisy.shape[0], x_noisy.device
+        sigmas = to_batch(batch_size=b, device=device, x=sigma, xs=sigmas)
+        c_skip, c_out, c_in, _ = self.get_scale_weights(sigmas)
+        t = self.sigma_to_t(sigmas)
+        x_pred = self.net(c_in * x_noisy, t, **kwargs)
         x_denoised = c_skip * x_noisy + c_out * x_pred
         return x_denoised
 
-    def forward(self, x: Tensor, noise: Tensor = None, **kwargs) -> Tensor:
-        batch_size, device = x.shape[0], x.device
+    def forward(self, x: Tensor, noise: Tensor = None, return_aux: bool = False, **kwargs):
+        b, device = x.shape[0], x.device
+        sigmas = self.sigma_distribution(num_samples=b, device=device)
+        c_skip, c_out, c_in, sigmas = self.get_scale_weights(sigmas)
 
-        # Sample amount of noise to add for each batch element
-        sigmas = self.sigma_distribution(num_samples=batch_size, device=device)
-        sigmas_padded = rearrange(sigmas, "b -> b 1 1")
+        x_noisy = x + rearrange(sigmas, "b -> b 1 1") * default(noise, lambda: torch.randn_like(x))
+        t = self.sigma_to_t(sigmas)
+        x_pred = self.net(c_in * x_noisy, t, **kwargs)  # v-pred
 
-        # Add noise to input
-        noise = default(noise, lambda: torch.randn_like(x))
-        x_noisy = x + sigmas_padded * noise
+        # v loss
+        v_target = (x - c_skip * x_noisy) / (c_out + 1e-8)
+        if self.robust == "huber":
+            losses_v = F.smooth_l1_loss(x_pred, v_target, reduction="none", beta=self.huber_delta)
+        elif self.robust == "charbonnier":
+            diff = x_pred - v_target
+            losses_v = torch.sqrt(diff * diff + self.charbonnier_eps * self.charbonnier_eps)
+        else:
+            losses_v = F.mse_loss(x_pred, v_target, reduction="none")
+        per_ex_v = einops_reduce(losses_v, "b ... -> b", "mean")
 
-        # Compute model output
-        c_skip, c_out, c_in = self.get_scale_weights(sigmas)
-        x_pred = self.net(c_in * x_noisy, self.sigma_to_t(sigmas), **kwargs)
+        # x0 consistency (kotwica)
+        x_hat = c_skip * x_noisy + c_out * x_pred     # rekonstrukcja x
+        losses_x0 = F.l1_loss(x_hat, x, reduction="none")
+        per_ex_x0 = einops_reduce(losses_x0, "b ... -> b", "mean")
 
-        # Compute v-objective target
-        v_target = (x - c_skip * x_noisy) / (c_out + 1e-7)
+        # Min-SNR wagi (na v-loss; można też na x0, ale zwykle nie trzeba)
+        if self.min_snr_gamma is not None:
+            snr = 1.0 / (sigmas**2 + 1e-8)
+            w = snr.clamp(max=self.min_snr_gamma) / (snr + 1e-8)
+            if self.normalize_weight:
+                w = w / (w.mean().detach() + 1e-8)
+            per_ex_v = per_ex_v * w
 
-        # Compute loss
-        loss = F.mse_loss(x_pred, v_target)
+        loss = per_ex_v.mean() + self.lambda_x0 * per_ex_x0.mean()
+
+        if return_aux:
+            return loss, {
+                "loss_v": per_ex_v.mean().detach(),
+                "loss_x0": per_ex_x0.mean().detach(),
+                "sigma_med": sigmas.median().detach(),
+            }
         return loss
-
 
 """
 Diffusion Sampling
@@ -361,187 +376,10 @@ class Sampler(nn.Module):
         raise NotImplementedError("Inpainting not available with current sampler")
 
 
-class VSampler(Sampler):
-
-    diffusion_types = [VDiffusion]
-
-    def get_alpha_beta(self, sigma: float) -> Tuple[float, float]:
-        angle = sigma * pi / 2
-        alpha = cos(angle)
-        beta = sin(angle)
-        return alpha, beta
-
-    def forward(
-        self, noise: Tensor, fn: Callable, sigmas: Tensor, num_steps: int
-    ) -> Tensor:
-        x = sigmas[0] * noise
-        alpha, beta = self.get_alpha_beta(sigmas[0].item())
-
-        for i in range(num_steps - 1):
-            is_last = i == num_steps - 1
-
-            x_denoised = fn(x, sigma=sigmas[i])
-            x_pred = x * alpha - x_denoised * beta
-            x_eps = x * beta + x_denoised * alpha
-
-            if not is_last:
-                alpha, beta = self.get_alpha_beta(sigmas[i + 1].item())
-                x = x_pred * alpha + x_eps * beta
-
-        return x_pred
 
 
-class KarrasSampler(Sampler):
-    """https://arxiv.org/abs/2206.00364 algorithm 1"""
-
-    diffusion_types = [KDiffusion, VKDiffusion]
-
-    def __init__(
-        self,
-        s_tmin: float = 0,
-        s_tmax: float = float("inf"),
-        s_churn: float = 0.0,
-        s_noise: float = 1.0,
-    ):
-        super().__init__()
-        self.s_tmin = s_tmin
-        self.s_tmax = s_tmax
-        self.s_noise = s_noise
-        self.s_churn = s_churn
-
-    def step(
-        self, x: Tensor, fn: Callable, sigma: float, sigma_next: float, gamma: float
-    ) -> Tensor:
-        """Algorithm 2 (step)"""
-        # Select temporarily increased noise level
-        sigma_hat = sigma + gamma * sigma
-        # Add noise to move from sigma to sigma_hat
-        epsilon = self.s_noise * torch.randn_like(x)
-        x_hat = x + sqrt(sigma_hat ** 2 - sigma ** 2) * epsilon
-        # Evaluate ∂x/∂sigma at sigma_hat
-        d = (x_hat - fn(x_hat, sigma=sigma_hat)) / sigma_hat
-        # Take euler step from sigma_hat to sigma_next
-        x_next = x_hat + (sigma_next - sigma_hat) * d
-        # Second order correction
-        if sigma_next != 0:
-            model_out_next = fn(x_next, sigma=sigma_next)
-            d_prime = (x_next - model_out_next) / sigma_next
-            x_next = x_hat + 0.5 * (sigma - sigma_hat) * (d + d_prime)
-        return x_next
-
-    def forward(
-        self, noise: Tensor, fn: Callable, sigmas: Tensor, num_steps: int
-    ) -> Tensor:
-        x = sigmas[0] * noise
-        # Compute gammas
-        gammas = torch.where(
-            (sigmas >= self.s_tmin) & (sigmas <= self.s_tmax),
-            min(self.s_churn / num_steps, sqrt(2) - 1),
-            0.0,
-        )
-        # Denoise to sample
-        for i in range(num_steps - 1):
-            x = self.step(
-                x, fn=fn, sigma=sigmas[i], sigma_next=sigmas[i + 1], gamma=gammas[i]  # type: ignore # noqa
-            )
-
-        return x
 
 
-class AEulerSampler(Sampler):
-
-    diffusion_types = [KDiffusion, VKDiffusion]
-
-    def get_sigmas(self, sigma: float, sigma_next: float) -> Tuple[float, float]:
-        sigma_up = sqrt(sigma_next ** 2 * (sigma ** 2 - sigma_next ** 2) / sigma ** 2)
-        sigma_down = sqrt(sigma_next ** 2 - sigma_up ** 2)
-        return sigma_up, sigma_down
-
-    def step(self, x: Tensor, fn: Callable, sigma: float, sigma_next: float) -> Tensor:
-        # Sigma steps
-        sigma_up, sigma_down = self.get_sigmas(sigma, sigma_next)
-        # Derivative at sigma (∂x/∂sigma)
-        d = (x - fn(x, sigma=sigma)) / sigma
-        # Euler method
-        x_next = x + d * (sigma_down - sigma)
-        # Add randomness
-        x_next = x_next + torch.randn_like(x) * sigma_up
-        return x_next
-
-    def forward(
-        self, noise: Tensor, fn: Callable, sigmas: Tensor, num_steps: int
-    ) -> Tensor:
-        x = sigmas[0] * noise
-        # Denoise to sample
-        for i in range(num_steps - 1):
-            x = self.step(x, fn=fn, sigma=sigmas[i], sigma_next=sigmas[i + 1])  # type: ignore # noqa
-        return x
-
-
-class ADPM2Sampler(Sampler):
-    """https://www.desmos.com/calculator/jbxjlqd9mb"""
-
-    diffusion_types = [KDiffusion, VKDiffusion]
-
-    def __init__(self, rho: float = 1.0):
-        super().__init__()
-        self.rho = rho
-
-    def get_sigmas(self, sigma: float, sigma_next: float) -> Tuple[float, float, float]:
-        r = self.rho
-        sigma_up = sqrt(sigma_next ** 2 * (sigma ** 2 - sigma_next ** 2) / sigma ** 2)
-        sigma_down = sqrt(sigma_next ** 2 - sigma_up ** 2)
-        sigma_mid = ((sigma ** (1 / r) + sigma_down ** (1 / r)) / 2) ** r
-        return sigma_up, sigma_down, sigma_mid
-
-    def step(self, x: Tensor, fn: Callable, sigma: float, sigma_next: float) -> Tensor:
-        # Sigma steps
-        sigma_up, sigma_down, sigma_mid = self.get_sigmas(sigma, sigma_next)
-        # Derivative at sigma (∂x/∂sigma)
-        d = (x - fn(x, sigma=sigma)) / sigma
-        # Denoise to midpoint
-        x_mid = x + d * (sigma_mid - sigma)
-        # Derivative at sigma_mid (∂x_mid/∂sigma_mid)
-        d_mid = (x_mid - fn(x_mid, sigma=sigma_mid)) / sigma_mid
-        # Denoise to next
-        x = x + d_mid * (sigma_down - sigma)
-        # Add randomness
-        x_next = x + torch.randn_like(x) * sigma_up
-        return x_next
-
-    def forward(
-        self, noise: Tensor, fn: Callable, sigmas: Tensor, num_steps: int
-    ) -> Tensor:
-        x = sigmas[0] * noise
-        # Denoise to sample
-        for i in range(num_steps - 1):
-            x = self.step(x, fn=fn, sigma=sigmas[i], sigma_next=sigmas[i + 1])  # type: ignore # noqa
-        return x
-
-    def inpaint(
-        self,
-        source: Tensor,
-        mask: Tensor,
-        fn: Callable,
-        sigmas: Tensor,
-        num_steps: int,
-        num_resamples: int,
-    ) -> Tensor:
-        x = sigmas[0] * torch.randn_like(source)
-
-        for i in range(num_steps - 1):
-            # Noise source to current noise level
-            source_noisy = source + sigmas[i] * torch.randn_like(source)
-            for r in range(num_resamples):
-                # Merge noisy source and current then denoise
-                x = source_noisy * mask + x * ~mask
-                x = self.step(x, fn=fn, sigma=sigmas[i], sigma_next=sigmas[i + 1])  # type: ignore # noqa
-                # Renoise if not last resample step
-                if r < num_resamples - 1:
-                    sigma = sqrt(sigmas[i] ** 2 - sigmas[i + 1] ** 2)
-                    x = x + sigma * torch.randn_like(x)
-
-        return source * mask + x * ~mask
 
 
 """ Main Classes """
@@ -581,8 +419,8 @@ class DiffusionSampler(nn.Module):
         # Append additional kwargs to denoise function (used e.g. for conditional unet)
         fn = lambda *a, **ka: self.denoise_fn(*a, **{**ka, **kwargs})  # noqa
         # Sample using sampler
-        x = self.sampler(noise, fn=fn, sigmas=sigmas, num_steps=num_steps)
-        x = x.clamp(-1.0, 1.0) if self.clamp else x
+        x = self.sampler(noise, fn=lambda *a, **ka: self.denoise_fn(*a, **{**ka, **kwargs}),
+                     sigmas=sigmas, num_steps=sigmas.numel())
         return x
 
 
@@ -654,38 +492,70 @@ class SpanBySpanComposer(nn.Module):
 
         return torch.cat(spans, dim=2)
 
+class DPMpp2MSampler(Sampler):
+    diffusion_types = [KDiffusion, VKDiffusion]
 
-class XDiffusion(nn.Module):
-    def __init__(self, type: str, net: nn.Module, **kwargs):
+    def __init__(self, s_churn: float = 0.0, s_tmin: float = 0.0,
+                 s_tmax: float = float("inf"), s_noise: float = 1.0):
         super().__init__()
+        self.s_churn = s_churn
+        self.s_tmin = s_tmin
+        self.s_tmax = s_tmax
+        self.s_noise = s_noise
 
-        diffusion_classes = [VDiffusion, KDiffusion, VKDiffusion]
-        aliases = [t.alias for t in diffusion_classes]  # type: ignore
-        message = f"type='{type}' must be one of {*aliases,}"
-        assert type in aliases, message
-        self.net = net
-
-        for XDiffusion in diffusion_classes:
-            if XDiffusion.alias == type:  # type: ignore
-                self.diffusion = XDiffusion(net=net, **kwargs)
-
-    def forward(self, *args, **kwargs) -> Tensor:
-        return self.diffusion(*args, **kwargs)
-
-    def sample(
+    def step(
         self,
-        noise: Tensor,
-        num_steps: int,
-        sigma_schedule: Schedule,
-        sampler: Sampler,
-        clamp: bool,
-        **kwargs,
+        x: Tensor,
+        fn: Callable,
+        sigma: float,
+        sigma_next: float,
+        i: int,
+        n: int,
+        d_prev: Optional[Tensor],
+        sigma_prev_hat: Optional[float],
+    ) -> Tuple[Tensor, Tensor, float]:
+        # Churn (EDM trick)
+        gamma = 0.0
+        if self.s_tmin <= sigma <= self.s_tmax:
+            gamma = min(self.s_churn / max(n - 1, 1), sqrt(2.0) - 1.0)
+        sigma_hat = sigma * (1.0 + gamma)
+        if gamma > 0.0:
+            eps = torch.randn_like(x) * self.s_noise
+            x = x + (sigma_hat**2 - sigma**2).sqrt() * eps
+
+        # Current derivative
+        denoised = fn(x, sigma=sigma_hat)
+        d = (x - denoised) / sigma_hat
+        h = sigma_next - sigma_hat
+
+        if d_prev is None:
+            # First step -> Euler
+            x_next = x + h * d
+        else:
+            # 2M multistep
+            # h_prev is the last effective step size
+            h_prev = sigma_hat - sigma_prev_hat
+            r = h / (h_prev + 1e-12)
+            x_next = x + h * ((1 + r) * d - r * d_prev)
+
+        return x_next, d, sigma_hat
+
+    def forward(
+        self, noise: Tensor, fn: Callable, sigmas: Tensor, num_steps: int
     ) -> Tensor:
-        diffusion_sampler = DiffusionSampler(
-            diffusion=self.diffusion,
-            sampler=sampler,
-            sigma_schedule=sigma_schedule,
-            num_steps=num_steps,
-            clamp=clamp,
-        )
-        return diffusion_sampler(noise, **kwargs)
+        x = sigmas[0] * noise
+        d_prev: Optional[Tensor] = None
+        sigma_prev_hat: Optional[float] = None
+
+        for i in range(num_steps - 1):
+            x, d_prev, sigma_prev_hat = self.step(
+                x,
+                fn=fn,
+                sigma=sigmas[i],
+                sigma_next=sigmas[i + 1],
+                i=i,
+                n=num_steps,
+                d_prev=d_prev,
+                sigma_prev_hat=sigma_prev_hat,
+            )
+        return x

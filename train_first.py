@@ -37,7 +37,6 @@ from torch.utils.tensorboard import SummaryWriter
 import logging
 from accelerate.logging import get_logger
 logger = get_logger(__name__, log_level="DEBUG")
-
 @click.command()
 @click.option('-p', '--config_path', default='Configs/config.yml', type=str)
 def main(config_path):
@@ -47,7 +46,7 @@ def main(config_path):
     if not osp.exists(log_dir): os.makedirs(log_dir, exist_ok=True)
     shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(project_dir=log_dir, split_batches=True, kwargs_handlers=[ddp_kwargs])    
+    accelerator = Accelerator(project_dir=log_dir, split_batches=True, kwargs_handlers=[ddp_kwargs], mixed_precision='bf16')   
     if accelerator.is_main_process:
         writer = SummaryWriter(log_dir + "/tensorboard")
 
@@ -66,14 +65,14 @@ def main(config_path):
     saving_epoch = config.get('save_freq', 2)
     
     data_params = config.get('data_params', None)
-    sr = config['preprocess_params'].get('sr', 24000)
+    sr = config['preprocess_params'].get('sr', 60000)
     train_path = data_params['train_data']
     val_path = data_params['val_data']
     root_path = data_params['root_path']
     min_length = data_params['min_length']
     OOD_data = data_params['OOD_data']
     
-    max_len = config.get('max_len', 200)
+    max_len = config.get('max_len', 8000)
     
     # load data
     train_list, val_list = get_data_path_list(train_path, val_path)
@@ -91,7 +90,7 @@ def main(config_path):
                                       root_path,
                                       OOD_data=OOD_data,
                                       min_length=min_length,
-                                      batch_size=batch_size,
+                                      batch_size=10,
                                       validation=True,
                                       num_workers=0,
                                       device=device,
@@ -118,7 +117,7 @@ def main(config_path):
         "epochs": epochs,
         "steps_per_epoch": len(train_dataloader),
     }
-    
+    #preprocess_params =  recursive_munch(config['preprocess_params'])
     model_params = recursive_munch(config['model_params'])
     multispeaker = model_params.multispeaker
     model = build_model(model_params, text_aligner, pitch_extractor, plbert)
@@ -164,13 +163,21 @@ def main(config_path):
     
     # wrapped losses for compatibility with mixed precision
     stft_loss = MultiResolutionSTFTLoss().to(device)
+    mag_phase_loss = MagPhaseLoss(
+        n_fft=model_params.decoder.gen_istft_n_fft,
+        hop_length=model_params.decoder.gen_istft_hop_size
+    ).to(device)
     gl = GeneratorLoss(model.mpd, model.msd).to(device)
     dl = DiscriminatorLoss(model.mpd, model.msd).to(device)
     wl = WavLMLoss(model_params.slm.model, 
                    model.wd, 
                    sr, 
                    model_params.slm.sr).to(device)
-
+    #sll = SSLFeatLoss("facebook/wav2vec2-xls-r-300m", model.wd, model_params.slm.sr)
+    #wav2vecXlsrPl = SpeechEmbeddingLossWav2VecPlXlsr(model.wd,sr,model_params.slm.sr).to("cuda")
+    #wav2vecXlsrPl = SpeechEmbeddingLossPL(model.wd,sr,model_params.slm.sr).to("cuda")
+    #sslPL = SpeechEmbeddingLossPL(model.wd,sr,"jonatasgrosman/wav2vec2-large-xlsr-53-polish",model_params.slm.sr)
+    
     for epoch in range(start_epoch, epochs):
         running_loss = 0
         start_time = time.time()
@@ -229,7 +236,7 @@ def main(config_path):
                 en.append(asr[bib, :, random_start:random_start+mel_len])
                 gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
 
-                y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
+                y = waves[bib][(random_start * 2) * 600:((random_start+mel_len) * 2) * 600]
                 wav.append(torch.from_numpy(y).to(device))
                 
                 # style reference (better to be different from the GT)
@@ -243,17 +250,17 @@ def main(config_path):
             wav = torch.stack(wav).float().detach()
 
             # clip too short to be used by the style encoder
-            if gt.shape[-1] < 80:
+            if gt.shape[-1] < 128:
                 continue
                 
             with torch.no_grad():    
                 real_norm = log_norm(gt.unsqueeze(1)).squeeze(1).detach()
                 F0_real, _, _ = model.pitch_extractor(gt.unsqueeze(1))
-                
-            s = model.style_encoder(st.unsqueeze(1) if multispeaker else gt.unsqueeze(1))
+            #print("GT shape before unsqueeze:", gt.shape)
+            #print("GT shape after unsqueeze:", gt.unsqueeze(1).shape)    
+            s = model.style_encoder(gt.unsqueeze(1))
             
-            y_rec = model.decoder(en, F0_real, real_norm, s)
-            
+            y_rec, mag , phase = model.decoder(en, F0_real, real_norm, s)
             # discriminator loss
             
             if epoch >= TMA_epoch:
@@ -268,8 +275,11 @@ def main(config_path):
             # generator loss
             optimizer.zero_grad()
             loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
+            loss_mag_phase = mag_phase_loss(mag ,phase,  wav.detach()) 
+     
             
-            if epoch >= TMA_epoch: # start TMA training
+            if epoch >= TMA_epoch: 
+        
                 loss_s2s = 0
                 for _s2s_pred, _text_input, _text_length in zip(s2s_pred, texts, input_lengths):
                     loss_s2s += F.cross_entropy(_s2s_pred[:_text_length], _text_input[:_text_length])
@@ -284,14 +294,16 @@ def main(config_path):
                 loss_params.lambda_mono * loss_mono + \
                 loss_params.lambda_s2s * loss_s2s + \
                 loss_params.lambda_gen * loss_gen_all + \
-                loss_params.lambda_slm * loss_slm
+                loss_params.lambda_slm * loss_slm + \
+                loss_params.lambda_mag  * loss_mag_phase
 
             else:
                 loss_s2s = 0
                 loss_mono = 0
                 loss_gen_all = 0
                 loss_slm = 0
-                g_loss = loss_mel
+                loss_mag = loss_mag_phase
+                g_loss =  loss_params.lambda_mel * loss_mel +  loss_params.lambda_mag* loss_mag_phase
             
             running_loss += accelerator.gather(loss_mel).mean().item()
 
@@ -308,8 +320,8 @@ def main(config_path):
             iters = iters + 1
             
             if (i+1)%log_interval == 0 and accelerator.is_main_process:
-                log_print ('Epoch [%d/%d], Step [%d/%d], Mel Loss: %.5f, Gen Loss: %.5f, Disc Loss: %.5f, Mono Loss: %.5f, S2S Loss: %.5f, SLM Loss: %.5f'
-                        %(epoch+1, epochs, i+1, len(train_list)//batch_size, running_loss / log_interval, loss_gen_all, d_loss, loss_mono, loss_s2s, loss_slm), logger)
+                log_print ('Epoch [%d/%d], Step [%d/%d], Mel Loss: %.5f, Gen Loss: %.5f, Disc Loss: %.5f, Mono Loss: %.5f, S2S Loss: %.5f, SLM Loss: %.5f , Mag Phase Loss: %.5f'
+                        %(epoch+1, epochs, i+1, len(train_list)//batch_size, running_loss / log_interval, loss_gen_all, d_loss, loss_mono, loss_s2s, loss_slm , loss_mag_phase), logger)
                 
                 writer.add_scalar('train/mel_loss', running_loss / log_interval, iters)
                 writer.add_scalar('train/gen_loss', loss_gen_all, iters)
@@ -317,7 +329,8 @@ def main(config_path):
                 writer.add_scalar('train/mono_loss', loss_mono, iters)
                 writer.add_scalar('train/s2s_loss', loss_s2s, iters)
                 writer.add_scalar('train/slm_loss', loss_slm, iters)
-
+                
+                writer.add_scalar('train/mag_phase_loss', loss_mag_phase, iters)
                 running_loss = 0
                 
                 print('Time elasped:', time.time()-start_time)
@@ -367,7 +380,7 @@ def main(config_path):
                     random_start = np.random.randint(0, mel_length - mel_len)
                     en.append(asr[bib, :, random_start:random_start+mel_len])
                     gt.append(mels[bib, :, (random_start * 2):((random_start+mel_len) * 2)])
-                    y = waves[bib][(random_start * 2) * 300:((random_start+mel_len) * 2) * 300]
+                    y = waves[bib][(random_start * 2) * 600:((random_start+mel_len) * 2) * 600]
                     wav.append(torch.from_numpy(y).to('cuda'))
 
                 wav = torch.stack(wav).float().detach()
@@ -378,9 +391,10 @@ def main(config_path):
                 F0_real, _, F0 = model.pitch_extractor(gt.unsqueeze(1))
                 s = model.style_encoder(gt.unsqueeze(1))
                 real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
-                y_rec = model.decoder(en, F0_real, real_norm, s)
+                y_rec, _ ,_   = model.decoder(en, F0_real, real_norm, s)
 
                 loss_mel = stft_loss(y_rec.squeeze(), wav.detach())
+                print(loss_mel)
 
                 loss_test += accelerator.gather(loss_mel).mean().item()
                 iters_test += 1
@@ -404,7 +418,7 @@ def main(config_path):
                     s = model.style_encoder(gt.unsqueeze(1))
                     real_norm = log_norm(gt.unsqueeze(1)).squeeze(1)
                     
-                    y_rec = model.decoder(en, F0_real, real_norm, s)
+                    y_rec, _ ,_   = model.decoder(en, F0_real, real_norm, s)
                     
                     writer.add_audio('eval/y' + str(bib), y_rec.cpu().numpy().squeeze(), epoch, sample_rate=sr)
                     if epoch == 0:

@@ -2,7 +2,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torchaudio
-from transformers import AutoModel
+from transformers import AutoModel, AutoFeatureExtractor, WhisperModel, WhisperConfig, WhisperPreTrainedModel
+from transformers.models.whisper.modeling_whisper import WhisperEncoder
+import whisper
 
 class SpectralConvergengeLoss(torch.nn.Module):
     """Spectral convergence loss module."""
@@ -30,7 +32,7 @@ class STFTLoss(torch.nn.Module):
         self.fft_size = fft_size
         self.shift_size = shift_size
         self.win_length = win_length
-        self.to_mel = torchaudio.transforms.MelSpectrogram(sample_rate=24000, n_fft=fft_size, win_length=win_length, hop_length=shift_size, window_fn=window)
+        self.to_mel = torchaudio.transforms.MelSpectrogram( n_mels=128, sample_rate=44100, n_fft=fft_size, win_length=win_length, hop_length=shift_size, window_fn=window)
 
         self.spectral_convergenge_loss = SpectralConvergengeLoss()
 
@@ -54,14 +56,66 @@ class STFTLoss(torch.nn.Module):
         sc_loss = self.spectral_convergenge_loss(x_mag, y_mag)    
         return sc_loss
 
+class MagPhaseLoss(torch.nn.Module):
+  
+    def __init__(self, *, n_fft, hop_length, eps=1e-10,
+                 mag_weight=1.0, phase_weight=0.1):
+        super().__init__()
+        window = torch.hann_window(n_fft)
+        self.register_buffer("window", window)
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.eps = eps
+        self.mag_weight = mag_weight
+        self.phase_weight = phase_weight
+
+    def forward(self, y_rec_mag, y_rec_phase, gt):
+    
+        if y_rec_mag is None or y_rec_phase is None:
+            raise ValueError("Predicted mag/phase must not be None")
+
+   
+        gt = gt.to(y_rec_mag.device, dtype=y_rec_mag.dtype)
+
+  
+        window = self.window
+        if window.dtype != gt.dtype:
+            window = window.to(dtype=gt.dtype)
+
+ 
+        y_stft = torch.stft(
+            gt,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.n_fft,
+            window=window,
+            return_complex=True,
+        )
+
+        target_mag = torch.abs(y_stft).clamp(min=self.eps) 
+        target_phase = torch.angle(y_stft)  # in radians, [-pi, pi]
+
+
+        # magnitude loss (L1)
+        loss_mag = F.l1_loss(y_rec_mag, target_mag)
+
+        # phase loss: compare sin/cos to avoid wrap-around issues
+        loss_phase = F.l1_loss(torch.cos(y_rec_phase),
+                               torch.cos(target_phase)) \
+                     + F.l1_loss(torch.sin(y_rec_phase),
+                                 torch.sin(target_phase))
+
+        loss = self.mag_weight * loss_mag + self.phase_weight * loss_phase
+        return loss
 
 class MultiResolutionSTFTLoss(torch.nn.Module):
     """Multi resolution STFT loss module."""
 
     def __init__(self,
-                 fft_sizes=[1024, 2048, 512],
-                 hop_sizes=[120, 240, 50],
-                 win_lengths=[600, 1200, 240],
+                 # NEW, CORRECTED PARAMETERS FOR 44.1kHz
+                 fft_sizes=[2048, 4096, 1024],
+                 hop_sizes=[240, 480, 160],
+                 win_lengths=[1200, 2400, 800],
                  window=torch.hann_window):
         """Initialize Multi resolution STFT loss module.
         Args:
@@ -189,49 +243,118 @@ class DiscriminatorLoss(torch.nn.Module):
         
         return d_loss.mean()
    
-    
-class WavLMLoss(torch.nn.Module):
+class WhisperEncoderOnly(WhisperPreTrainedModel):
+    def __init__(self, config: WhisperConfig):
+        super().__init__(config)
+        self.encoder = WhisperEncoder(config)
 
+    def forward(self, input_features, attention_mask=None, output_hidden_states=None):
+        # you may want to forward through encoder and return the ModelOutput-like object
+        return self.encoder(input_features, attention_mask=attention_mask,
+                            output_hidden_states=output_hidden_states)
+
+class WavLMLoss(torch.nn.Module):
     def __init__(self, model, wd, model_sr, slm_sr=16000):
         super(WavLMLoss, self).__init__()
-        self.wavlm = AutoModel.from_pretrained(model)
+
+        # Load the full whisper-small model and extract only the encoder
+        full_model = WhisperModel.from_pretrained(
+            "openai/whisper-small",
+            device_map='auto',           # OK if you have accelerate support; otherwise omit
+            torch_dtype=torch.bfloat16   # change if your GPU doesn't support bfloat16
+        )
+
+        # Create encoder-only model with the same config and copy weights
+        config = full_model.config
+        encoder_only = WhisperEncoderOnly(config)
+        encoder_only.encoder.load_state_dict(full_model.encoder.state_dict())
+        del full_model
+
+        self.wavlm = encoder_only.to(torch.bfloat16)  # or torch.float16 / torch.float32
         self.wd = wd
         self.resample = torchaudio.transforms.Resample(model_sr, slm_sr)
-     
-    def forward(self, wav, y_rec):
-        with torch.no_grad():
-            wav_16 = self.resample(wav)
-            wav_embeddings = self.wavlm(input_values=wav_16, output_hidden_states=True).hidden_states
-        y_rec_16 = self.resample(y_rec)
-        y_rec_embeddings = self.wavlm(input_values=y_rec_16.squeeze(), output_hidden_states=True).hidden_states
+        for p in self.wavlm.parameters():
+            p.requires_grad = False
 
-        floss = 0
-        for er, eg in zip(wav_embeddings, y_rec_embeddings):
-            floss += torch.mean(torch.abs(er - eg))
+    def forward(self, wav, y_rec, generator=False, discriminator=False, discriminator_forward=False):
+        wav = wav.squeeze(1)
+        y_rec = y_rec.squeeze(1)
+        wav = whisper.pad_or_trim(wav)
+        wav = whisper.log_mel_spectrogram(wav)
+
+        y_rec = whisper.pad_or_trim(y_rec)
+        y_rec = whisper.log_mel_spectrogram(y_rec)
+
+        with torch.no_grad():
+            wav_embeddings = self.wavlm.encoder(
+                wav.to(torch.bfloat16),
+                output_hidden_states=True
+            ).hidden_states
+        y_rec_embeddings = self.wavlm.encoder(
+            y_rec.to(torch.bfloat16),
+            output_hidden_states=True
+        ).hidden_states
+
+        pooled_weight = 1.0
+        frame_weight = 0.2  
+        layer_weights = None 
+        loss =0
+        total = 0.0
+        n = len(wav_embeddings)
+        if layer_weights is None:
+            layer_weights = [1.0] * n
+
+        for w, er, eg in zip(layer_weights, wav_embeddings, y_rec_embeddings):
+            er = er.float()  
+            eg = eg.float()
+
+            er_pool = er.mean(dim=1)   
+            eg_pool = eg.mean(dim=1)
+            pooled_l1_per = torch.mean(torch.abs(er_pool - eg_pool), dim=1) 
+            frame_l1_per  = torch.mean(torch.abs(er - eg), dim=(1, 2))
+
+            layer_loss = pooled_weight * pooled_l1_per + frame_weight * frame_l1_per
+            #layer_loss = frame_l1_per
+            total += w * layer_loss
+
         
-        return floss.mean()
-    
+        return total.mean()
     def generator(self, y_rec):
-        y_rec_16 = self.resample(y_rec)
-        y_rec_embeddings = self.wavlm(input_values=y_rec_16, output_hidden_states=True).hidden_states
+        
+        y_rec = y_rec.squeeze(1)
+        
+
+        y_rec = whisper.pad_or_trim(y_rec)
+        y_rec = whisper.log_mel_spectrogram(y_rec)
+
+        with torch.no_grad():
+            y_rec_embeddings = self.wavlm.encoder(y_rec.to(torch.bfloat16), output_hidden_states=True).hidden_states
         y_rec_embeddings = torch.stack(y_rec_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
-        y_df_hat_g = self.wd(y_rec_embeddings)
+        y_df_hat_g = self.wd(y_rec_embeddings.to(torch.float32))
         loss_gen = torch.mean((1-y_df_hat_g)**2)
         
-        return loss_gen
-    
+        return loss_gen.to(torch.float32)
+
     def discriminator(self, wav, y_rec):
+        
+        wav = wav.squeeze(1)
+        y_rec = y_rec.squeeze(1)
+
+        wav = whisper.pad_or_trim(wav)
+        wav = whisper.log_mel_spectrogram(wav)
+
+        y_rec = whisper.pad_or_trim(y_rec)
+        y_rec = whisper.log_mel_spectrogram(y_rec)
+
         with torch.no_grad():
-            wav_16 = self.resample(wav)
-            wav_embeddings = self.wavlm(input_values=wav_16, output_hidden_states=True).hidden_states
-            y_rec_16 = self.resample(y_rec)
-            y_rec_embeddings = self.wavlm(input_values=y_rec_16, output_hidden_states=True).hidden_states
+            wav_embeddings = self.wavlm.encoder(wav.to(torch.bfloat16), output_hidden_states=True).hidden_states
+            y_rec_embeddings = self.wavlm.encoder(y_rec.to(torch.bfloat16), output_hidden_states=True).hidden_states
 
             y_embeddings = torch.stack(wav_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
             y_rec_embeddings = torch.stack(y_rec_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
 
-        y_d_rs = self.wd(y_embeddings)
-        y_d_gs = self.wd(y_rec_embeddings)
+        y_d_rs = self.wd(y_embeddings.to(torch.float32))
+        y_d_gs = self.wd(y_rec_embeddings.to(torch.float32))
         
         y_df_hat_r, y_df_hat_g = y_d_rs, y_d_gs
         
@@ -240,14 +363,25 @@ class WavLMLoss(torch.nn.Module):
         
         loss_disc_f = r_loss + g_loss
                         
-        return loss_disc_f.mean()
+        return loss_disc_f.mean().to(torch.float32)
+    
+    
+
 
     def discriminator_forward(self, wav):
+        # Squeeze the channel dimension if it's unnecessary
+        wav = wav.squeeze(1) # Adjust this line if the channel dimension is not at dim=1
+
+
         with torch.no_grad():
+            
             wav_16 = self.resample(wav)
-            wav_embeddings = self.wavlm(input_values=wav_16, output_hidden_states=True).hidden_states
+            wav_16 = whisper.pad_or_trim(wav_16)
+            wav_16 = whisper.log_mel_spectrogram(wav_16)
+            
+            wav_embeddings = self.wavlm.encoder(wav_16.to(torch.bfloat16) , output_hidden_states=True).hidden_states
             y_embeddings = torch.stack(wav_embeddings, dim=1).transpose(-1, -2).flatten(start_dim=1, end_dim=2)
 
-        y_d_rs = self.wd(y_embeddings)
+        y_d_rs = self.wd(y_embeddings.to(torch.float32))
         
         return y_d_rs

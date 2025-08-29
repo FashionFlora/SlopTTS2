@@ -29,14 +29,37 @@ def load_plbert(log_dir):
 
     checkpoint = torch.load(log_dir + "/step_" + str(iters) + ".t7", map_location='cpu')
     state_dict = checkpoint['net']
-    from collections import OrderedDict
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        name = k[7:] # remove `module.`
-        if name.startswith('encoder.'):
-            name = name[8:] # remove `encoder.`
+    
+    # Check if any key starts with 'module.'
+    has_module_prefix = any(k.startswith('module.') for k in state_dict.keys())
+    
+    if has_module_prefix:
+        print("has module prefix")
+        # If 'module.' prefix exists, process the state dict
+        from collections import OrderedDict
+        new_state_dict = OrderedDict()
+        for k, v in state_dict.items():
+            name = k[7:]  # remove `module.`
+            if name.startswith('encoder.'):
+                name = name[8:]  # remove `encoder.`
             new_state_dict[name] = v
-    del new_state_dict["embeddings.position_ids"]
-    bert.load_state_dict(new_state_dict, strict=False)
+        
+        # Try to delete the specific key if it exists
+        try:
+            del new_state_dict["embeddings.position_ids"]
+        except KeyError:
+            pass
+        
+        bert.load_state_dict(new_state_dict, strict=False)
+    else:
+        print("no has module prefix")
+        # If no 'module.' prefix, load normally
+        try:
+            if "embeddings.position_ids" in state_dict:
+                del state_dict["embeddings.position_ids"]
+        except KeyError:
+            pass
+        
+        bert.load_state_dict(state_dict, strict=False)
     
     return bert

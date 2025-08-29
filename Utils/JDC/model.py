@@ -32,17 +32,17 @@ class JDCNet(nn.Module):
         self.pool_block = nn.Sequential(
             nn.BatchNorm2d(num_features=256),
             nn.LeakyReLU(leaky_relu_slope, inplace=True),
-            nn.MaxPool2d(kernel_size=(1, 4)),  # (b, 256, 31, 2)
+            nn.MaxPool2d(kernel_size=(1, 8)),  # (b, 256, 31, 2)
             nn.Dropout(p=0.2),
         )
 
         # maxpool layers (for auxiliary network inputs)
         # in = (b, 128, 31, 513) from conv_block, out = (b, 128, 31, 2)
-        self.maxpool1 = nn.MaxPool2d(kernel_size=(1, 40))
+        self.maxpool1 = nn.MaxPool2d(kernel_size=(1, 64))
         # in = (b, 128, 31, 128) from res_block1, out = (b, 128, 31, 2)
-        self.maxpool2 = nn.MaxPool2d(kernel_size=(1, 20))
+        self.maxpool2 = nn.MaxPool2d(kernel_size=(1, 32))
         # in = (b, 128, 31, 32) from res_block2, out = (b, 128, 31, 2)
-        self.maxpool3 = nn.MaxPool2d(kernel_size=(1, 10))
+        self.maxpool3 = nn.MaxPool2d(kernel_size=(1, 16))
 
         # in = (b, 640, 31, 2), out = (b, 256, 31, 2)
         self.detector_conv = nn.Sequential(

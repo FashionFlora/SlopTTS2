@@ -65,9 +65,10 @@ class SpecDiscriminator(nn.Module):
 class MultiResSpecDiscriminator(torch.nn.Module):
 
     def __init__(self,
-                 fft_sizes=[1024, 2048, 512],
-                 hop_sizes=[120, 240, 50],
-                 win_lengths=[600, 1200, 240],
+                 # NEW, CORRECTED PARAMETERS FOR 44.1kHz
+                 fft_sizes=[2048, 4096, 1024],
+                 hop_sizes=[240, 480, 160],
+                 win_lengths=[1200, 2400, 800],
                  window="hann_window"):
 
         super(MultiResSpecDiscriminator, self).__init__()
@@ -163,6 +164,38 @@ class WavLMDiscriminator(nn.Module):
                  initial_channel=64, 
                  use_spectral_norm=False):
         super(WavLMDiscriminator, self).__init__()
+        norm_f = weight_norm if use_spectral_norm == False else spectral_norm
+        self.pre = norm_f(Conv1d(slm_hidden * slm_layers, initial_channel, 1, 1, padding=0))
+        
+        self.convs = nn.ModuleList([
+            norm_f(nn.Conv1d(initial_channel, initial_channel * 2, kernel_size=5, padding=2)),
+            norm_f(nn.Conv1d(initial_channel * 2, initial_channel * 4, kernel_size=5, padding=2)),
+            norm_f(nn.Conv1d(initial_channel * 4, initial_channel * 4, 5, 1, padding=2)),
+        ])
+
+        self.conv_post = norm_f(Conv1d(initial_channel * 4, 1, 3, 1, padding=1))
+        
+    def forward(self, x):
+        x = self.pre(x)
+        
+        fmap = []
+        for l in self.convs:
+            x = l(x)
+            x = F.leaky_relu(x, LRELU_SLOPE)
+            fmap.append(x)
+        x = self.conv_post(x)
+        x = torch.flatten(x, 1, -1)
+
+        return x
+        
+class Wav2VecDiscriminator(nn.Module):
+    """docstring for Discriminator."""
+
+    def __init__(self, slm_hidden=1024, 
+                 slm_layers=25, 
+                 initial_channel=64, 
+                 use_spectral_norm=False):
+        super(Wav2VecDiscriminator, self).__init__()
         norm_f = weight_norm if use_spectral_norm == False else spectral_norm
         self.pre = norm_f(Conv1d(slm_hidden * slm_layers, initial_channel, 1, 1, padding=0))
         
